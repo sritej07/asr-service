@@ -1,13 +1,20 @@
 import torch
 import torchaudio
 import torch.nn.functional as F
-import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import json
-# -----------------------------
-# 1. MiniWav2Vec2 Model Class
-# -----------------------------
+import gradio as gr
+from typing import Dict
+
+# --- Configuration ---
+# Set the device to CPU for the free tier
+DEVICE = "cpu"
+MODEL_PATH = "mini_wav2vec2_full_6000.pth"
+IDX2CHAR_PATH = "idx2char.json"
+TARGET_SR = 16000
+
+# ==============================================================================
+# === 1. MiniWav2Vec2 Model Class (Keep exactly as before) ===
+# ==============================================================================
 class MiniWav2Vec2(torch.nn.Module):
     def __init__(self, input_dim=40, hidden_dim=128, num_layers=2, num_classes=30):
         super().__init__()
@@ -28,168 +35,120 @@ class MiniWav2Vec2(torch.nn.Module):
         x = self.transformer(x)
         return self.fc(x)
 
-# -----------------------------
-# 2. Token mapping helpers
-# -----------------------------
-def greedy_decode(log_probs, idx2char):
+# ==============================================================================
+# === 2. Token mapping helpers (Keep exactly as before) ===
+# ==============================================================================
+def greedy_decode(log_probs, idx2char: Dict[int, str]):
     max_probs = torch.argmax(log_probs, dim=-1)
     decoded_texts = []
     for seq in max_probs:
         prev_id = None
         decoded_seq = []
         for idx in seq.cpu().numpy():
-            if idx != 0 and idx != prev_id:  # skip pad and duplicates
+            if idx != 0 and idx != prev_id:
                 decoded_seq.append(idx2char.get(idx, ""))
             prev_id = idx
         decoded_texts.append("".join(decoded_seq))
     return decoded_texts
 
-# -----------------------------
-# 3. ASR Model Handler
-# -----------------------------
-class ASRModel:
-    def __init__(self, model_path, idx2char_path):
-        print("Loading model...")
-        # Load char mapping
-        with open(idx2char_path, "r", encoding="utf-8") as f:
-            self.idx2char = {int(k): v for k, v in json.load(f).items()}
+# ==============================================================================
+# === 3. ASR Inference Function (Adapted from the Flask handler) ===
+# ==============================================================================
 
+# Global model and artifacts, loaded once at startup
+MODEL = None
+IDX2CHAR = None
+MFCC_TRANSFORM = None
 
-        # Load model
-        torch.serialization.add_safe_globals([MiniWav2Vec2])
-        self.model = torch.load(model_path, map_location="cpu", weights_only=False)
-        self.model.eval()
-        self.resample = torchaudio.transforms.Resample(orig_freq=22050, new_freq=16000)
-        self.mfcc = torchaudio.transforms.MFCC(sample_rate=16000, n_mfcc=40)
-        print("Model loaded successfully!")
-        
-    def transcribe(self, audio_file_path, debug=True):
-        """
-        Robust transcription with extensive shape logging and safe resampling.
-        Returns transcription string on success, or raises/returns a helpful error.
-        """
-        try:
-            # 1) load
-            waveform, sr = torchaudio.load(audio_file_path)  # waveform: [channels, time]
-            if debug:
-                print(f"[DEBUG] loaded waveform.shape={tuple(waveform.shape)}, sr={sr}")
+def load_model_and_artifacts():
+    """Loads all heavy assets once at application startup."""
+    global MODEL, IDX2CHAR, MFCC_TRANSFORM
+    
+    if MODEL is not None:
+        return # Already loaded
 
-            # 2) if sample rate differs from target, create a resampler using actual sr
-            target_sr = 16000
-            if sr != target_sr:
-                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
-                waveform = resampler(waveform)
-                if debug:
-                    print(f"[DEBUG] resampled -> waveform.shape={tuple(waveform.shape)}, new_sr={target_sr}")
-            else:
-                if debug:
-                    print(f"[DEBUG] sample rate already {target_sr}, skipping resample")
-
-            # 3) convert to mono (average channels) if needed
-            if waveform.dim() == 2 and waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)  # [1, time]
-                if debug:
-                    print(f"[DEBUG] converted to mono -> waveform.shape={tuple(waveform.shape)}")
-            elif waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)  # ensure [1, time]
-                if debug:
-                    print(f"[DEBUG] added batch dim -> waveform.shape={tuple(waveform.shape)}")
-
-            # 4) optional amplitude normalization (helps MFCC stability)
-            max_val = waveform.abs().max()
-            if max_val > 0:
-                waveform = waveform / (max_val + 1e-9)
-                if debug:
-                    print(f"[DEBUG] normalized waveform max value before: {max_val:.6f}")
-
-            # 5) compute MFCCs
-            mfcc_feats = self.mfcc(waveform)  # expected [1, n_mfcc, frames]
-            if debug:
-                print(f"[DEBUG] mfcc_feats.shape={tuple(mfcc_feats.shape)}")
-
-            # Validate MFCC dims
-            if mfcc_feats.dim() != 3:
-                raise RuntimeError(f"MFCC output expected 3 dims (C, n_mfcc, frames) but got {mfcc_feats.dim()} dims")
-
-            # 6) convert to model's expected shape (batch, T, features)
-            # mfcc_feats: [1, n_mfcc, frames] -> feats: [1, frames, n_mfcc]
-            feats = mfcc_feats.permute(0, 2, 1)  # safe and explicit
-            if debug:
-                print(f"[DEBUG] feats.shape (batch, T, features) = {tuple(feats.shape)}")
-
-            # sanity: ensure feats is 3D and features dim equals model input_dim (40 by default)
-            if feats.dim() != 3:
-                raise RuntimeError(f"feats must be 3D, got shape {tuple(feats.shape)}")
-            expected_feature_dim = feats.shape[2]
-            if expected_feature_dim != 40:
-                # not fatal, but warn if your model expects 40 MFCCs
-                print(f"[WARN] feature dim = {expected_feature_dim}; model may expect 40 MFCC features.")
-
-            lengths = torch.tensor([feats.shape[1]])
-            if debug:
-                print(f"[DEBUG] lengths={lengths.tolist()}")
-
-            # 7) forward pass
-            with torch.no_grad():
-                logits = self.model(feats, lengths)  # shape -> [batch, T, num_classes]
-                if debug:
-                    print(f"[DEBUG] logits.shape={tuple(logits.shape)}")
-
-                log_probs = F.log_softmax(logits, dim=-1)
-                if debug:
-                    print(f"[DEBUG] log_probs.shape={tuple(log_probs.shape)}")
-
-                preds = greedy_decode(log_probs, self.idx2char)
-            return preds[0]
-
-        except Exception as e:
-            # Attach traceback / helpful debug info
-            import traceback
-            tb = traceback.format_exc()
-            print("[ERROR] Exception in transcribe():", str(e))
-            print(tb)
-            # Re-raise so Flask error handler can capture it (or return an error string if you prefer)
-            raise
-
-
-
-# -----------------------------
-# 4. Flask App Setup
-# -----------------------------
-app = Flask(__name__)
-CORS(app)
-
-print("Starting server and loading the model...")
-asr_model = ASRModel(
-    model_path="mini_wav2vec2_full_6000.pth",   # your saved model file
-    idx2char_path="idx2char.json"           # saved mapping
-)
-print("Server is ready to accept API requests.")
-
-# -----------------------------
-# 5. API Endpoint
-# -----------------------------
-@app.route('/transcribe', methods=['POST'])
-def handle_transcription():
+    print("Loading model and artifacts...")
     try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No file part"}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"error": 'No selected file'}), 400
+        # Load char mapping
+        with open(IDX2CHAR_PATH, "r", encoding="utf-8") as f:
+            IDX2CHAR = {int(k): v for k, v in json.load(f).items()}
 
-        temp_path = "temp_audio_file.wav"
-        file.save(temp_path)
+        # Load model (ensure safe globals for custom class)
+        torch.serialization.add_safe_globals([MiniWav2Vec2])
+        MODEL = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+        MODEL.eval()
+        MODEL.to(DEVICE)
 
-        transcription = asr_model.transcribe(temp_path)
-        os.remove(temp_path)
-        return jsonify({"text": transcription})
+        # Initialize MFCC transform
+        MFCC_TRANSFORM = torchaudio.transforms.MFCC(
+            sample_rate=TARGET_SR, 
+            n_mfcc=40
+        ).to(DEVICE)
+        
+        print("Model loaded successfully!")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"FATAL ERROR during model loading: {e}")
+        raise RuntimeError("Failed to load model dependencies.")
 
-# -----------------------------
-# 6. Run the App
-# -----------------------------
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5050))
-    app.run(host='0.0.0.0', port=port)
+# The core transcription logic
+def transcribe_audio_file(audio_file_path: str) -> str:
+    """
+    Transcribes an audio file path provided by Gradio.
+    """
+    load_model_and_artifacts() # Ensure model is loaded
+    
+    try:
+        # 1) Load waveform
+        waveform, sr = torchaudio.load(audio_file_path) # [channels, time]
+
+        # 2) Resample if needed
+        if sr != TARGET_SR:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TARGET_SR).to(DEVICE)
+            waveform = resampler(waveform.to(DEVICE))
+        else:
+            waveform = waveform.to(DEVICE)
+
+        # 3) Convert to mono
+        if waveform.dim() == 2 and waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        elif waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+
+        # 4) Compute MFCCs
+        mfcc_feats = MFCC_TRANSFORM(waveform) # [1, n_mfcc, frames]
+
+        # 5) Prepare for model (batch, T, features)
+        feats = mfcc_feats.permute(0, 2, 1) # [1, frames, n_mfcc]
+
+        if feats.shape[1] == 0:
+            return "Error: Audio file too short to generate MFCC features."
+        
+        lengths = torch.tensor([feats.shape[1]])
+
+        # 6) Forward pass
+        with torch.no_grad():
+            logits = MODEL(feats, lengths) 
+            log_probs = F.log_softmax(logits, dim=-1)
+            preds = greedy_decode(log_probs, IDX2CHAR)
+            
+            return preds[0] if preds else "Transcription failed."
+
+    except Exception as e:
+        import traceback
+        return f"Transcription Error: {str(e)} \nTraceback: {traceback.format_exc()}"
+
+
+# ==============================================================================
+# === 4. Gradio Interface ===
+# ==============================================================================
+gr.Interface(
+    fn=transcribe_audio_file,
+    inputs=[
+        gr.Audio(type="filepath", label="Upload Audio (.wav, .mp3) or Record")
+    ],
+    outputs=[
+        gr.Textbox(label="Transcription Result")
+    ],
+    title="Mini Wav2Vec2 ASR Demo",
+    description="Upload an audio file (or record audio) to get a real-time speech transcription using a custom PyTorch model."
+).launch(server_name="0.0.0.0", server_port=7860) # Gradio default port
